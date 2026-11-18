@@ -11,6 +11,8 @@ from src.middlewares.request_id import RequestIdMiddleware
 @asynccontextmanager
 async def lifespan(app):
     Base.metadata.create_all(engine)
+    from src.config.database import ensure_columns
+    ensure_columns()
     if os.getenv('SEED_DEMO','true')=='true':
         try:
             from scripts.seed_demo import seed

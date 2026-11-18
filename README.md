@@ -32,6 +32,32 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 另有 `QY-1117-B` 高延迟副本回退主库、`QY-1117-C` 主库故障且副本未追平的拒绝案例。所有试验使用冻结快照，不会把模型故障写回节点台账。
 
+范围分页读另含两个请求集：`QY-1117-D` 键序分页（翻页期间并发插删、重试不推进游标、末页读完）与 `QY-1117-E` portable 换节点续页。演练表单可选快照保留版本数（1–50，默认8）与续页策略（pinned/portable，默认pinned）。
+
+## 范围分页读规则
+
+在原有路由事件之外新增三类时序事件，仍按 at_ms 非递减进入同一条确定性时间线：
+
+```json
+[
+  {"at_ms":0,"kind":"kv_put","session":"lab-KV","key":"key-01","value":"航道A"},
+  {"at_ms":10,"kind":"kv_delete","session":"lab-KV","key":"key-03"},
+  {"at_ms":40,"kind":"range_page","session":"lab-KV","scan_id":"scan-1","page_no":1,"start_key":"key-01","page_size":2},
+  {"at_ms":90,"kind":"range_page","session":"lab-KV","scan_id":"scan-1","page_no":2},
+  {"at_ms":95,"kind":"range_page","session":"lab-KV","scan_id":"scan-1","page_no":3,"retry":true}
+]
+```
+
+- kv_put/kv_delete：主库在线才成功，主库位点+1并写入变更日志；delete 保留墓碑，旧快照仍可重放，所以翻页期间的增删不会改变已选快照的内容。每个会话同步记录 required_position。
+- 有限快照窗口：每个节点只保留最近 N 个**数据变更版本**（纯日志复制不产生新版本、不触发淘汰）；窗口满时淘汰最旧的未锚定快照，模拟快照空间有限。窗口下界会写进逐事件证据。
+- 首屏（page_no=1）：按会话 required_position 选择**当前已经持有该快照**的在线同谱系副本（在线/同谱系/位点足够/快照仍在窗口/延迟达标，五条件并列，排序沿用延迟升序、位点降序、名称字典序），**不等待任何副本追平**；无达标副本时与普通 read 一样回退主库，主库也无法提供该快照才中断并说明原因。
+- 续页：携带不可变游标（scan_id + next_key + 快照位点），始终按键字典序读首屏那一份快照，因此不会丢失记录、不会读到翻页期间的新版。
+- 两种续页策略的取舍：
+  - **pinned（默认）**：首屏节点被锚定，其快照受窗口淘汰保护；首屏延迟等于节点延迟，速度最快。代价是锚点下线/谱系变化/快照丢失时**直接中断、不可换节点**。
+  - **portable**：不锚定节点，窗口内任一合格节点都可续页、支持换节点；代价是副本首屏多一次快照登记开销（模型记为节点延迟+20ms，主库兜底无此开销），所有节点都回收该快照后仍会中断。
+- 重试（retry=true）：只针对“待执行的下一页”（如响应丢失后重发同一请求），用当前游标重新取同一页，**游标与已服务页计数均不推进**；已读完的页不能用 retry 重发（入队前422），扫描 finished/interrupted 后新请求按拒绝处理。
+- 中断不是任务失败：trace 中以 decision=interrupted 留档，summary 单列 interrupted 计数，并给出具体原因（锚点下线/快照窗口回收/无合格节点）。证据页按 scan_id 展示“待执行→读完/中断”的每页时序、服务节点、快照位点、游标前后值与本页键值。
+
 ## 真实计算规则
 
 输入上限12节点、100事件；时间0–86400000ms，事件按at_ms非递减，时间相同按输入顺序执行。必须有且仅一个主节点，同谱系副本初始位点不能超过主库。事件字段：
@@ -44,6 +70,8 @@ docker compose exec -T backend python -m scripts.seed_demo
   {"at_ms":700,"kind":"read","session":"lab-A"}
 ]
 ```
+
+事件 kind 共八种：write/read、replicate/node_down/node_up，以及范围分页读的 kv_put/kv_delete/range_page（分页规则见上一节）。
 
 - write：主库在线才成功；主库位点+1，记录该会话required_position和last_write_ms。失败写入不推进会话位点。
 - read：若距最近成功写入 `< sticky_ms`，必须主库在线、同谱系且位点满足；否则拒绝。到达边界即结束粘滞。
@@ -67,11 +95,11 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 共享枚举角色admin/operator/viewer与任务queued/running/completed/failed位于 `backend/src/constants/enums.py` / `frontend/src/constants/enums.js`，security/trials、frame/badge消费。节点角色primary/replica和状态healthy/down由node schema及前端表单定义，事件类型由request_set schema及路由算法定义。
 
-环境变量见.env.example：COMPOSE_PROJECT_NAME、三端口、DB_PASSWORD、JWT_SECRET、SEED_DEMO。默认密码仅本地演示、JWT8小时；seed自然键仅补缺失，不覆盖修改。schema由metadata.create_all初始建表，无在线升级引擎。5服务均健康检查，backend/worker依赖健康db/redis，frontend依赖backend；数据库、Redis、worker产物使用命名卷。
+环境变量见.env.example：COMPOSE_PROJECT_NAME、三端口、DB_PASSWORD、JWT_SECRET、SEED_DEMO。默认密码仅本地演示、JWT8小时；seed自然键仅补缺失，不覆盖修改。schema由metadata.create_all初始建表，无在线升级引擎；范围分页特性新增的 trials 两列由启动时 `ensure_columns` 幂等补列（离线DDL见 migrations/001_initial.sql）。5服务均健康检查，backend/worker依赖健康db/redis，frontend依赖backend；数据库、Redis、worker产物使用命名卷。
 
-本地开发：Python3.11安装backend/requirements.txt、配置DATABASE_URL/REDIS_URL，在backend运行 `uvicorn src.main:app --reload` 和 `python -m src.worker`，前端经Nginx同源代理。停止清空：`docker compose down -v --remove-orphans`。
+本地开发：Python3.11安装backend/requirements.txt、配置DATABASE_URL/REDIS_URL，在backend运行 `uvicorn src.main:app --reload` 和 `python -m src.worker`，前端经Nginx同源代理。停止清空：`docker compose down -v --remove-orphans`。纯引擎测试不依赖外部服务：`python3 -I tests/test_scan_engine.py`（在仓库根目录执行）。
 
-限制：单worker串行、无生产任务重试/崩溃续跑；不模拟网络随机抖动、自动选主或完整GTID集合。Google Fonts离线回退，业务不依赖字体网络。
+限制：单worker串行、无生产任务重试/崩溃续跑；不模拟网络随机抖动、自动选主或完整GTID集合。分页扫描的快照是模型内物化视图，不连接真实存储引擎；portable 的首屏登记开销为固定模型值20ms，用于展示策略取舍而非真实基准。Google Fonts离线回退，业务不依赖字体网络。
 
 ## License
 

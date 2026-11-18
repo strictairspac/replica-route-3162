@@ -12,7 +12,8 @@ while True:
     try:
         with Session() as db:
             obj=db.get(Trial,ident);obj.status='running';db.commit();snapshot=obj.input_snapshot;delay=obj.max_delay_ms;sticky=obj.sticky_ms
-        result=simulate(snapshot['nodes'],snapshot['request_set']['events'],delay,sticky)
+            retention=getattr(obj,'snapshot_retention',8) or 8;serving=getattr(obj,'scan_serving','pinned') or 'pinned'
+        result=simulate(snapshot['nodes'],snapshot['request_set']['events'],delay,sticky,retention,serving)
         with Session() as db:
             obj=db.get(Trial,ident);obj.result=result;obj.status='completed';db.commit()
         Path(f'/artifacts/route-{ident}.json').write_text(json.dumps(result,ensure_ascii=False,indent=2))
